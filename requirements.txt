@@ -1,8 +1,6 @@
 streamlit
 streamlit-webrtc
 mediapipe
-protobuf
-opencv-python-headless
+opencv-python
 numpy
-av
 pandas

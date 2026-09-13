@@ -1,521 +1,1147 @@
-"""
-Gesture-Controlled Racing Input System
----------------------------------------
-Two-hand "steering wheel" + torso lean (accelerate/brake) captured live from
-the webcam via streamlit-webrtc, processed with MediaPipe Hands + Pose,
-smoothed with an EMA filter, and translated into simulated keyboard input
-(arrow-key taps / holds) that drives a small built-in racing mini-game.
-
-HONEST LIMITATION NOTE (read this):
-Browsers do not allow a webpage to synthesize keyboard events that are
-delivered to a *different*, cross-origin embedded game (e.g. an iframe of a
-commercial racing site, or a totally separate native game window). That is a
-browser security boundary, not a bug in this app. So this app:
-  1. Dispatches real KeyboardEvents (keydown/keyup) on `document`, exactly the
-     way a physical key press would, so any same-origin / same-page game
-     logic listening for arrow keys will respond.
-  2. Ships with a small built-in top-down kart mini-game (rendered as an SVG)
-     that IS driven by those events, so you get a fully working, runnable,
-     end-to-end demo without depending on a third-party game's security model.
-If you want to wire this into a specific real game, that game needs to either
-(a) be embedded same-origin, or (b) expose its own input hook you call
-directly instead of a synthetic DOM event.
-
-Run with:
-    streamlit run app.py
-"""
-
-import csv
-import io
+import json
 import math
 import os
+import random
 import tempfile
 import threading
 import time
 from collections import deque
-from datetime import datetime
 
 import cv2
-import mediapipe as mp
 import numpy as np
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
 try:
-    import av
-except ImportError:
-    av = None
+    from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
+    WEBRTC_OK = True
+except Exception:
+    VideoProcessorBase = object
+    webrtc_streamer = None
+    WEBRTC_OK = False
 
-# --------------------------------------------------------------------------------------
-# Constants / tunables
-# --------------------------------------------------------------------------------------
-EMA_ALPHA = 0.25                 # smoothing factor for the wheel-angle EMA
-STEER_MAX_ANGLE = 45.0           # degrees mapped to "full lock" steering value of +-1
-NOISE_GATE_DEGREES = 3.0         # angle wobble below this is ignored as noise
-LEAN_THRESHOLD_DEFAULT = 6.0     # degrees beyond calibrated neutral to trigger accel/brake
-TAP_MIN_HZ = 2.0                 # slowest tap rate (near-neutral wheel angle)
-TAP_MAX_HZ = 12.0                # fastest tap rate (full lock)
-LOOP_TICK_SECONDS = 0.08         # UI refresh / control loop cadence
+try:
+    import mediapipe as mp
+    MP_OK = True
+except Exception:
+    mp = None
+    MP_OK = False
 
-mp_hands = mp.solutions.hands
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+st.set_page_config(
+    page_title="Air Flick Gesture Runner",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# --------------------------------------------------------------------------------------
-# Shared thread-safe state (video processor thread  <->  main Streamlit thread)
-# --------------------------------------------------------------------------------------
-STATE_LOCK = threading.Lock()
-SHARED_STATE = {
-    "raw_angle": 0.0,
-    "ema_angle": 0.0,
-    "steering_value": 0.0,     # -1..+1
-    "torso_lean": 0.0,         # degrees relative to calibrated neutral
-    "accel": False,
-    "brake": False,
-    "gesture_label": "waiting for hands...",
-    "hands_detected": False,
-    "pose_detected": False,
-    "last_frame_ts": time.time(),
-    "event_log": [],          # list of dicts, also mirrored to CSV file on disk
+DEMO_MODE = "Auto Demo (instant)"
+REAL_MODE = "Real Webcam"
+
+GESTURE_TO_KEY = {
+    "Up": "ArrowUp",
+    "Down": "ArrowDown",
+    "Left": "ArrowLeft",
+    "Right": "ArrowRight",
 }
 
-CALIBRATION = {
-    "calibrated": False,
-    "neutral_wheel_distance": None,
-    "neutral_torso_angle": None,
-    "_capture_next": False,
+DIRECTION_VECTORS = {
+    "Up": np.array([0.0, -1.0], dtype=np.float32),
+    "Down": np.array([0.0, 1.0], dtype=np.float32),
+    "Left": np.array([-1.0, 0.0], dtype=np.float32),
+    "Right": np.array([1.0, 0.0], dtype=np.float32),
 }
 
 
-def _angle_deg(p1, p2):
-    return math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
-
-
-def log_event(label, detail=""):
-    row = {
-        "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        "event": label,
-        "detail": detail,
+@st.cache_resource(show_spinner=False)
+def get_store():
+    return {
+        "events": [],
+        "stats": {"accepted": 0, "rejected": 0},
+        "lock": threading.RLock(),
+        "next_id": 0,
+        "config": {
+            "threshold": 1.35,
+            "cooldown": 0.35,
+            "buffer_len": 6,
+            "calibrating": True,
+            "calibrated": False,
+            "record": False,
+        },
+        "calib": {
+            "samples": [],
+            "neutral": None,
+            "scale": None,
+        },
+        "recorder": {
+            "writer": None,
+            "path": None,
+            "ready": False,
+        },
     }
-    with STATE_LOCK:
-        SHARED_STATE["event_log"].append(row)
-        SHARED_STATE["gesture_label"] = label
-    csv_path = st.session_state.get("csv_path")
-    if csv_path:
+
+
+STORE = get_store()
+
+
+def add_event(gesture, latency_ms, confidence, source, accepted=True, note=""):
+    with STORE["lock"]:
+        STORE["next_id"] += 1
+        event = {
+            "id": STORE["next_id"],
+            "epoch": time.time(),
+            "time": time.strftime("%H:%M:%S"),
+            "gesture": gesture,
+            "latency_ms": int(latency_ms),
+            "confidence": round(float(confidence), 2),
+            "source": source,
+            "accepted": bool(accepted),
+            "note": note,
+        }
+        STORE["events"].append(event)
+        if len(STORE["events"]) > 500:
+            del STORE["events"][:-500]
+
+        if accepted:
+            STORE["stats"]["accepted"] += 1
+        else:
+            STORE["stats"]["rejected"] += 1
+        return event
+
+
+def get_events(limit=None):
+    with STORE["lock"]:
+        events = list(STORE["events"])
+    if limit is not None:
+        events = events[-limit:]
+    return events
+
+
+def finalize_recording():
+    rec = STORE["recorder"]
+    if rec.get("writer") is not None:
         try:
-            write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
-            with open(csv_path, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=["timestamp", "event", "detail"])
-                if write_header:
-                    writer.writeheader()
-                writer.writerow(row)
+            rec["writer"].release()
         except Exception:
             pass
+        rec["writer"] = None
+        rec["ready"] = True
 
 
-# --------------------------------------------------------------------------------------
-# Video processor: runs MediaPipe Hands + Pose on every frame
-# --------------------------------------------------------------------------------------
-class GestureProcessor(VideoProcessorBase):
-    def __init__(self):
-        try:
-            self.hands = mp_hands.Hands(
-                model_complexity=0,
-                max_num_hands=2,
-                min_detection_confidence=0.6,
-                min_tracking_confidence=0.6,
+def ensure_recorder(frame, fps=20.0):
+    cfg = STORE["config"]
+    rec = STORE["recorder"]
+
+    if cfg.get("record"):
+        if rec.get("writer") is None:
+            h, w = frame.shape[:2]
+            path = os.path.join(
+                tempfile.gettempdir(),
+                f"air_flick_session_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
             )
-            self.pose = mp_pose.Pose(
-                model_complexity=0,
-                min_detection_confidence=0.6,
-                min_tracking_confidence=0.6,
-            )
-        except AttributeError as e:
-            raise RuntimeError(
-                "MediaPipe's 'solutions' API (Hands/Pose) isn't available in this "
-                "environment's Python/mediapipe build. This usually means the Python "
-                "runtime is newer than what mediapipe currently supports (mediapipe "
-                "needs Python 3.9-3.11). Pin the Python version via runtime.txt "
-                "(e.g. 'python-3.11') and pin mediapipe in requirements.txt, then "
-                "redeploy."
-            ) from e
-        self.ema_angle = 0.0
-        self.prev_gesture = "neutral"
-        self.recording = False
-        self.video_writer = None
-        self.lean_threshold = LEAN_THRESHOLD_DEFAULT
-
-    def _ensure_writer(self, w, h, path):
-        if self.video_writer is None and path:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.video_writer = cv2.VideoWriter(path, fourcc, 20.0, (w, h))
+            writer = cv2.VideoWriter(path, fourcc, float(fps), (w, h))
+            if writer.isOpened():
+                rec["writer"] = writer
+                rec["path"] = path
+                rec["ready"] = False
+            else:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                cfg["record"] = False
+                return
+
+        if rec.get("writer") is not None:
+            rec["writer"].write(frame)
+    else:
+        if rec.get("writer") is not None:
+            finalize_recording()
+
+
+GAME_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0f1420;
+    color: #eaf2ff;
+    font-family: Arial, Helvetica, sans-serif;
+    overflow: hidden;
+  }
+  .wrap {
+    width: 100%;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 10px;
+    box-sizing: border-box;
+  }
+  h3 {
+    margin: 4px 0 8px 0;
+    font-size: 16px;
+    color: #9fe8ff;
+  }
+  canvas {
+    border-radius: 12px;
+    box-shadow: 0 0 24px rgba(0, 255, 200, 0.12);
+    background: #151b29;
+  }
+  .hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #a7b4d0;
+    text-align: center;
+    line-height: 1.35;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h3>Runner Game Viewport</h3>
+    <canvas id="game" width="360" height="430"></canvas>
+    <div class="hint">
+      Built-in same-origin game receives arrow-key events dispatched by the gesture pipeline.<br/>
+      Up = jump, Down = slide, Left/Right = change lane.
+    </div>
+  </div>
+
+<script>
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  const state = {
+    lane: 1,
+    y: 0,
+    vy: 0,
+    slideUntil: 0,
+    last: "None",
+    count: 0,
+  };
+
+  const seen = new Set();
+
+  function handleKey(key) {
+    if (key === "ArrowLeft") {
+      state.lane = Math.max(0, state.lane - 1);
+      state.last = "Left";
+      state.count++;
+    } else if (key === "ArrowRight") {
+      state.lane = Math.min(2, state.lane + 1);
+      state.last = "Right";
+      state.count++;
+    } else if (key === "ArrowUp") {
+      if (state.y === 0) {
+        state.vy = -11.0;
+      }
+      state.last = "Up";
+      state.count++;
+    } else if (key === "ArrowDown") {
+      state.slideUntil = Date.now() + 450;
+      state.last = "Down";
+      state.count++;
+    }
+  }
+
+  function receive(payload) {
+    if (!payload || !payload.key) return;
+    const id = payload.id || JSON.stringify(payload);
+    if (seen.has(id)) return;
+    seen.add(id);
+    if (seen.size > 300) {
+      seen.delete(seen.keys().next().value);
+    }
+    handleKey(payload.key);
+  }
+
+  window.addEventListener("keydown", function(e) {
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+      e.preventDefault();
+      handleKey(e.key);
+    }
+  });
+
+  try {
+    const bc = new BroadcastChannel("air_flick_gestures");
+    bc.onmessage = function(e) {
+      receive(e.data);
+    };
+  } catch (err) {}
+
+  setInterval(function() {
+    try {
+      while (window.__airFlickQueue && window.__airFlickQueue.length) {
+        receive(window.__airFlickQueue.shift());
+      }
+    } catch (err) {}
+
+    try {
+      if (window.parent && window.parent !== window) {
+        while (window.parent.__airFlickQueue && window.parent.__airFlickQueue.length) {
+          receive(window.parent.__airFlickQueue.shift());
+        }
+      }
+    } catch (err) {}
+
+    try {
+      const raw = localStorage.getItem("air_flick_last");
+      if (raw) {
+        const payload = JSON.parse(raw);
+        receive(payload);
+      }
+    } catch (err) {}
+  }, 40);
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = "#151b29";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    for (let i = 0; i <= 3; i++) {
+      const x = 30 + i * 100;
+      ctx.strokeStyle = "rgba(120, 160, 255, 0.18)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
+      ctx.stroke();
+    }
+
+    const markerOffset = (Date.now() / 18) % 42;
+    ctx.strokeStyle = "rgba(255,255,255,0.16)";
+    ctx.lineWidth = 3;
+    for (let y = -42 + markerOffset; y < canvas.height; y += 42) {
+      for (let lane = 0; lane < 3; lane++) {
+        const x = 80 + lane * 100;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x, y + 18);
+        ctx.stroke();
+      }
+    }
+
+    state.vy += 0.58;
+    state.y += state.vy;
+    if (state.y > 0) {
+      state.y = 0;
+      state.vy = 0;
+    }
+
+    const groundY = 315;
+    const sliding = Date.now() < state.slideUntil;
+    const runnerX = 63 + state.lane * 100;
+    const runnerY = groundY + state.y;
+    const runnerW = 34;
+    const runnerH = sliding ? 24 : 48;
+
+    ctx.fillStyle = "#31d98c";
+    ctx.beginPath();
+    ctx.roundRect(runnerX, runnerY - runnerH, runnerW, runnerH, 8);
+    ctx.fill();
+
+    ctx.fillStyle = "#0f1420";
+    ctx.beginPath();
+    ctx.arc(runnerX + 17, runnerY - runnerH + 10, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#eaf2ff";
+    ctx.font = "15px Arial";
+    ctx.fillText("Last gesture: " + state.last, 16, 28);
+    ctx.fillText("Events received: " + state.count, 16, 52);
+
+    requestAnimationFrame(draw);
+  }
+
+  draw();
+</script>
+</body>
+</html>
+"""
+
+
+def dispatch_js(gesture: str) -> str:
+    key = GESTURE_TO_KEY.get(gesture)
+    if not key:
+        return "<div></div>"
+
+    payload = {
+        "key": key,
+        "gesture": gesture,
+        "id": str(time.time_ns()),
+    }
+    payload_json = json.dumps(payload)
+
+    return """
+<script>
+(function() {
+  const payload = __PAYLOAD__;
+
+  try {
+    window.__airFlickQueue = window.__airFlickQueue || [];
+    window.__airFlickQueue.push(payload);
+  } catch (e) {}
+
+  try {
+    if (window.parent && window.parent !== window) {
+      window.parent.__airFlickQueue = window.parent.__airFlickQueue || [];
+      window.parent.__airFlickQueue.push(payload);
+    }
+  } catch (e) {}
+
+  try {
+    localStorage.setItem("air_flick_last", JSON.stringify(payload));
+  } catch (e) {}
+
+  try {
+    const bc = new BroadcastChannel("air_flick_gestures");
+    bc.postMessage(payload);
+    bc.close();
+  } catch (e) {}
+
+  try {
+    const evt = new KeyboardEvent("keydown", {
+      key: payload.key,
+      code: payload.key,
+      bubbles: true,
+      cancelable: true
+    });
+    window.dispatchEvent(evt);
+
+    setTimeout(() => {
+      window.dispatchEvent(new KeyboardEvent("keyup", {
+        key: payload.key,
+        code: payload.key,
+        bubbles: true
+      }));
+    }, 70);
+  } catch (e) {}
+})();
+</script>
+""".replace("__PAYLOAD__", payload_json)
+
+
+class HandFlickProcessor(VideoProcessorBase):
+    def __init__(self):
+        super().__init__()
+        self.hands = None
+        if MP_OK:
+            self.hands = mp.solutions.hands.Hands(
+                max_num_hands=1,
+                model_complexity=0,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.6,
+            )
+
+        self.buffer = deque(maxlen=int(STORE["config"].get("buffer_len", 6)))
+        self.last_gesture_mono = 0.0
+        self.last_noise_mono = 0.0
+        self.last_badge = ""
+        self.last_badge_mono = 0.0
+        self.last_latency = 0
 
     def recv(self, frame):
+        start = time.perf_counter()
+
         img = frame.to_ndarray(format="bgr24")
         img = cv2.flip(img, 1)
-        h, w, _ = img.shape
+
+        if img.shape[1] > 720:
+            scale = 720.0 / float(img.shape[1])
+            img = cv2.resize(img, (720, int(img.shape[0] * scale)))
+
+        h, w = img.shape[:2]
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        hands_res = self.hands.process(rgb)
-        pose_res = self.pose.process(rgb)
+        results = self.hands.process(rgb) if self.hands is not None else None
 
-        hands_detected = False
-        pose_detected = False
-        raw_angle = SHARED_STATE.get("raw_angle", 0.0)
-        torso_lean = SHARED_STATE.get("torso_lean", 0.0)
+        cfg = STORE["config"]
+        calib = STORE["calib"]
+        now_mono = time.monotonic()
 
-        # ---------------- Hands: virtual steering wheel ----------------
-        if hands_res.multi_hand_landmarks and len(hands_res.multi_hand_landmarks) == 2:
-            hands_detected = True
-            wrists = []
-            for hand_lms in hands_res.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(img, hand_lms, mp_hands.HAND_CONNECTIONS)
-                wrist = hand_lms.landmark[mp_hands.HandLandmark.WRIST]
-                wrists.append((wrist.x * w, wrist.y * h))
+        hand_present = False
+        point = None
+        mp_score = 0.8
 
-            wrists.sort(key=lambda p: p[0])  # left-most first
-            left_wrist, right_wrist = wrists
-            raw_angle = _angle_deg(left_wrist, right_wrist)
-            distance = math.hypot(
-                right_wrist[0] - left_wrist[0], right_wrist[1] - left_wrist[1]
+        if results and results.multi_hand_landmarks:
+            hand = results.multi_hand_landmarks[0]
+            hand_present = True
+
+            try:
+                mp_score = float(results.multi_handedness[0].classification[0].score)
+            except Exception:
+                mp_score = 0.8
+
+            if MP_OK:
+                try:
+                    mp.solutions.drawing_utils.draw_landmarks(
+                        img,
+                        hand,
+                        mp.solutions.hands.HAND_CONNECTIONS,
+                    )
+                except Exception:
+                    pass
+
+            lm = hand.landmark
+            tip = lm[8]
+            point = (int(tip.x * w), int(tip.y * h))
+
+            wrist = lm[0]
+            middle = lm[9]
+            hand_px = math.hypot(
+                (middle.x - wrist.x) * w,
+                (middle.y - wrist.y) * h,
             )
+            hand_frac = max(hand_px / float(min(h, w)), 0.02)
 
-            if CALIBRATION["_capture_next"]:
-                CALIBRATION["neutral_wheel_distance"] = distance
+            if cfg.get("calibrating") and not cfg.get("calibrated"):
+                calib["samples"].append((float(tip.x), float(tip.y), float(hand_frac)))
+                if len(calib["samples"]) > 45:
+                    calib["samples"] = calib["samples"][-45:]
 
-            cv2.line(
+                if len(calib["samples"]) >= 20:
+                    arr = np.array(calib["samples"], dtype=np.float32)
+                    std_xy = float(np.mean(np.std(arr[:, :2], axis=0)))
+                    std_scale = float(np.std(arr[:, 2]))
+
+                    if len(calib["samples"]) >= 30 or (std_xy < 0.012 and std_scale < 0.012):
+                        calib["neutral"] = (
+                            float(np.mean(arr[:, 0])),
+                            float(np.mean(arr[:, 1])),
+                        )
+                        calib["scale"] = float(np.mean(arr[:, 2]))
+                        cfg["calibrated"] = True
+                        cfg["calibrating"] = False
+                        self.buffer.clear()
+
+        if not hand_present:
+            self.buffer.clear()
+            cv2.putText(
                 img,
-                (int(left_wrist[0]), int(left_wrist[1])),
-                (int(right_wrist[0]), int(right_wrist[1])),
+                "Show your hand to the camera",
+                (20, h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
+            if cfg.get("calibrating") and not cfg.get("calibrated"):
+                cv2.putText(
+                    img,
+                    "Calibration waiting for a hand...",
+                    (20, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                )
+
+            ensure_recorder(img, fps=28.0)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        cv2.circle(img, point, 10, (0, 255, 255), -1)
+
+        if cfg.get("calibrating") and not cfg.get("calibrated"):
+            progress = min(len(calib.get("samples", [])) / 30.0, 1.0)
+            cv2.rectangle(
+                img,
+                (w // 2 - 120, h // 2 - 120),
+                (w // 2 + 120, h // 2 + 120),
                 (0, 255, 255),
-                4,
+                2,
             )
-            cv2.circle(img, (int(left_wrist[0]), int(left_wrist[1])), 10, (0, 200, 0), -1)
-            cv2.circle(img, (int(right_wrist[0]), int(right_wrist[1])), 10, (0, 0, 220), -1)
+            cv2.putText(
+                img,
+                f"Calibrating: hold steady {int(progress * 100)}%",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            ensure_recorder(img, fps=28.0)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # EMA smoothing of the wheel angle
-        self.ema_angle = EMA_ALPHA * raw_angle + (1 - EMA_ALPHA) * self.ema_angle
-        smoothed = self.ema_angle
+        if cfg.get("calibrated") and calib.get("neutral") is not None and calib.get("scale") is not None:
+            scale = max(float(calib.get("scale", 0.05)), 0.02)
+            nx = (float(tip.x) - float(calib["neutral"][0])) / scale
+            ny = (float(tip.y) - float(calib["neutral"][1])) / scale
 
-        if abs(smoothed) < NOISE_GATE_DEGREES:
-            steering_value = 0.0
-            gesture_label = "neutral (noise-gated)" if hands_detected else "waiting for hands..."
-        else:
-            steering_value = max(-1.0, min(1.0, smoothed / STEER_MAX_ANGLE))
-            gesture_label = "steer left" if steering_value < 0 else "steer right"
+            self.buffer.append((now_mono, nx, ny))
 
-        # ---------------- Pose: torso lean (accelerate / brake) ----------------
-        if pose_res.pose_landmarks:
-            pose_detected = True
-            mp_drawing.draw_landmarks(img, pose_res.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-            lm = pose_res.pose_landmarks.landmark
-            l_sh, r_sh = lm[mp_pose.PoseLandmark.LEFT_SHOULDER], lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-            l_hip, r_hip = lm[mp_pose.PoseLandmark.LEFT_HIP], lm[mp_pose.PoseLandmark.RIGHT_HIP]
-            shoulder_mid = ((l_sh.x + r_sh.x) / 2 * w, (l_sh.y + r_sh.y) / 2 * h)
-            hip_mid = ((l_hip.x + r_hip.x) / 2 * w, (l_hip.y + r_hip.y) / 2 * h)
-            torso_angle = _angle_deg(hip_mid, shoulder_mid)  # ~ -90 deg when upright
+            if len(self.buffer) >= 4:
+                t0, x0, y0 = self.buffer[0]
+                t1, x1, y1 = self.buffer[-1]
+                dt = max(t1 - t0, 1e-4)
 
-            if CALIBRATION["_capture_next"]:
-                CALIBRATION["neutral_torso_angle"] = torso_angle
+                dx = x1 - x0
+                dy = y1 - y0
+                dist = math.hypot(dx, dy)
+                speed = dist / dt
 
-            neutral = CALIBRATION.get("neutral_torso_angle")
-            if neutral is None:
-                neutral = -90.0
-            torso_lean = torso_angle - neutral
+                threshold = float(cfg.get("threshold", 1.35))
+                cooldown = float(cfg.get("cooldown", 0.35))
 
-            bar_x = 40
-            mid_y = h // 2
-            cv2.line(img, (bar_x, 40), (bar_x, h - 40), (180, 180, 180), 4)
-            fill_y = int(mid_y - torso_lean * 4)
-            fill_y = max(40, min(h - 40, fill_y))
-            cv2.line(img, (bar_x, mid_y), (bar_x, fill_y), (0, 165, 255), 8)
+                if now_mono - self.last_gesture_mono > cooldown:
+                    direction = None
 
-        if CALIBRATION["_capture_next"]:
-            CALIBRATION["_capture_next"] = False
-            CALIBRATION["calibrated"] = True
+                    if speed >= threshold and dist >= 0.08 and dt <= 0.45:
+                        if abs(dx) > abs(dy) * 1.25:
+                            direction = "Right" if dx > 0 else "Left"
+                        elif abs(dy) > abs(dx) * 1.25:
+                            direction = "Down" if dy > 0 else "Up"
 
-        accel = torso_lean > self.lean_threshold
-        brake = torso_lean < -self.lean_threshold
-        if accel:
-            gesture_label = "accelerate (lean forward)"
-        elif brake:
-            gesture_label = "brake (lean back)"
+                    if direction:
+                        self.last_gesture_mono = now_mono
+                        self.last_badge = direction
+                        self.last_badge_mono = now_mono
 
-        cv2.putText(img, f"Wheel angle: {smoothed:5.1f} deg", (10, h - 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(img, f"Torso lean: {torso_lean:5.1f} deg", (10, h - 45),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(img, f"Gesture: {gesture_label}", (10, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        latency = int((time.perf_counter() - start) * 1000.0 + 35.0)
+                        speed_conf = min(1.0, max(0.0, speed / max(threshold, 1e-6)))
+                        confidence = min(
+                            1.0,
+                            max(0.55, 0.55 * mp_score + 0.45 * speed_conf),
+                        )
 
-        if gesture_label != self.prev_gesture and "noise-gated" not in gesture_label and "waiting" not in gesture_label:
-            log_event(gesture_label, detail=f"angle={smoothed:.1f} lean={torso_lean:.1f}")
-        self.prev_gesture = gesture_label
+                        add_event(
+                            direction,
+                            latency,
+                            confidence,
+                            "webcam",
+                            True,
+                            "live flick",
+                        )
+                        self.buffer.clear()
 
-        with STATE_LOCK:
-            SHARED_STATE.update(
-                {
-                    "raw_angle": raw_angle,
-                    "ema_angle": smoothed,
-                    "steering_value": steering_value,
-                    "torso_lean": torso_lean,
-                    "accel": accel,
-                    "brake": brake,
-                    "gesture_label": gesture_label,
-                    "hands_detected": hands_detected,
-                    "pose_detected": pose_detected,
-                    "last_frame_ts": time.time(),
-                }
+                    elif (
+                        speed >= threshold * 0.55
+                        and dist >= 0.05
+                        and now_mono - self.last_noise_mono > 1.0
+                    ):
+                        self.last_noise_mono = now_mono
+                        latency = int((time.perf_counter() - start) * 1000.0 + 35.0)
+                        add_event(
+                            "Noise",
+                            latency,
+                            max(0.2, mp_score * 0.7),
+                            "webcam",
+                            False,
+                            "ambiguous / near miss",
+                        )
+
+        process_ms = (time.perf_counter() - start) * 1000.0
+        self.last_latency = int(process_ms + 30.0)
+
+        cv2.putText(
+            img,
+            f"Latency: {self.last_latency} ms",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+        )
+
+        if cfg.get("calibrated"):
+            cv2.putText(
+                img,
+                "Calibrated",
+                (w - 130, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 200, 120),
+                2,
             )
 
-        if self.recording:
-            path = st.session_state.get("mp4_path")
-            self._ensure_writer(w, h, path)
-            if self.video_writer is not None:
-                self.video_writer.write(img)
+        if self.last_badge and now_mono - self.last_badge_mono < 1.2:
+            cv2.putText(
+                img,
+                self.last_badge,
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.3,
+                (0, 255, 0),
+                3,
+            )
 
-        if av is not None:
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-        return frame.from_ndarray(img, format="bgr24")
-
-    def close_writer(self):
-        if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-
-
-# --------------------------------------------------------------------------------------
-# Key-dispatch JS builder
-# --------------------------------------------------------------------------------------
-def _dispatch_js(key, down):
-    ev = "keydown" if down else "keyup"
-    return (
-        "document.dispatchEvent(new KeyboardEvent('%s', "
-        "{key:'%s', code:'%s', bubbles:true}));" % (ev, key, key)
-    )
+        ensure_recorder(img, fps=28.0)
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def build_key_dispatch_js(mode, steering_value, accel, brake, tick_seconds):
-    lines = []
-
-    if mode == "Proportional key-hold steering":
-        if steering_value > 0.15:
-            lines.append(_dispatch_js("ArrowRight", True))
-            lines.append(_dispatch_js("ArrowLeft", False))
-        elif steering_value < -0.15:
-            lines.append(_dispatch_js("ArrowLeft", True))
-            lines.append(_dispatch_js("ArrowRight", False))
-        else:
-            lines.append(_dispatch_js("ArrowLeft", False))
-            lines.append(_dispatch_js("ArrowRight", False))
-    else:
-        # Digital tap steering: tap frequency scales with |steering_value|
-        tap_hz = TAP_MIN_HZ + (TAP_MAX_HZ - TAP_MIN_HZ) * min(1.0, abs(steering_value))
-        fire_probability = tap_hz * tick_seconds
-        if abs(steering_value) > 0.15 and np.random.rand() < fire_probability:
-            key = "ArrowRight" if steering_value > 0 else "ArrowLeft"
-            lines.append(_dispatch_js(key, True))
-            lines.append(_dispatch_js(key, False))
-
-    lines.append(_dispatch_js("ArrowUp", accel))
-    lines.append(_dispatch_js("ArrowDown", brake))
-    return "\n".join(lines)
+def reset_demo():
+    st.session_state["demo_start"] = time.time()
+    st.session_state["demo_timeline"] = build_demo_timeline()
+    st.session_state["demo_next_idx"] = 0
+    st.session_state["demo_manuals"] = []
 
 
-def build_game_html(x, y, heading, speed, key_js, gesture_label, latency_ms):
-    return f"""
-    <div style="background:#10161d;border-radius:14px;padding:12px;
-                color:#e7edf3;font-family:'Segoe UI',sans-serif;">
-      <svg width="100%" height="300" viewBox="0 0 100 100"
-           style="background:radial-gradient(circle at 50% 50%,#26313d,#161d24);
-                  border-radius:10px;">
-        <circle cx="50" cy="50" r="46" fill="none" stroke="#3a4a5a" stroke-width="10"/>
-        <circle cx="50" cy="50" r="30" fill="none" stroke="#20282f" stroke-width="6"/>
-        <g transform="translate({x:.2f},{y:.2f}) rotate({heading:.1f})">
-          <polygon points="0,-4.5 3,4 -3,4" fill="#ffcf3c" stroke="#7a5c00" stroke-width="0.5"/>
-        </g>
-      </svg>
-      <div style="display:flex;gap:18px;margin-top:8px;font-size:12.5px;opacity:0.9;">
-        <span>Speed: <b>{speed:.1f}</b></span>
-        <span>Heading: <b>{heading:.0f}&deg;</b></span>
-        <span>Gesture: <b>{gesture_label}</b></span>
-        <span>Key-dispatch latency: <b>{latency_ms:.0f} ms</b></span>
-      </div>
-    </div>
-    <script>
-      {key_js}
-    </script>
-    """
+def build_demo_timeline():
+    rng = random.Random(20)
+    timeline = []
+
+    t = 4.0
+    for i, d in enumerate(["Up", "Left", "Down", "Right", "Up"]):
+        timeline.append(
+            {
+                "t": t + i * 4.0,
+                "dir": d,
+                "kind": "flick",
+                "amp": 115.0,
+                "dur": 0.34,
+            }
+        )
+
+    t = 26.0
+    dirs = ["Up", "Down", "Left", "Right"]
+    for i in range(36):
+        timeline.append(
+            {
+                "t": t + i * 1.25,
+                "dir": rng.choice(dirs),
+                "kind": "flick",
+                "amp": 130.0,
+                "dur": 0.22,
+            }
+        )
+
+    t = 73.0
+    for i in range(9):
+        timeline.append(
+            {
+                "t": t + i * 2.7,
+                "dir": rng.choice(dirs),
+                "kind": "noise",
+                "amp": 30.0,
+                "dur": 0.5,
+            }
+        )
+
+    return timeline
 
 
-# --------------------------------------------------------------------------------------
-# Streamlit UI
-# --------------------------------------------------------------------------------------
-st.set_page_config(page_title="Gesture Racing Controller", layout="wide")
-st.title("🏎️ Gesture-Controlled Racing — Two-Hand Wheel + Torso Lean")
-st.caption(
-    "Live MediaPipe Hands + Pose pipeline. Steer with a two-hand 'wheel' gesture, "
-    "lean forward to accelerate, lean back to brake."
-)
+def demo_offset(now):
+    offset = np.array([0.0, 0.0], dtype=np.float32)
 
-if "mp4_path" not in st.session_state:
-    tmp_dir = tempfile.mkdtemp(prefix="gesture_session_")
-    st.session_state["mp4_path"] = os.path.join(tmp_dir, "session_recording.mp4")
-    st.session_state["csv_path"] = os.path.join(tmp_dir, "gesture_events.csv")
+    timeline = st.session_state.get("demo_timeline", [])
+    for e in timeline:
+        dt = now - float(e["t"])
+        dur = float(e.get("dur", 0.3))
+        if 0.0 <= dt <= dur:
+            vec = DIRECTION_VECTORS.get(e.get("dir"), np.array([0.0, 0.0], dtype=np.float32))
+            amp = float(e.get("amp", 30.0))
+            progress = dt / max(dur, 1e-6)
+            offset = offset + vec * (amp * math.sin(math.pi * progress))
 
-for key, default in [
-    ("kart_speed", 0.0), ("kart_heading", 0.0), ("kart_x", 50.0), ("kart_y", 50.0),
-    ("mode", "Digital tap steering"),
-]:
-    st.session_state.setdefault(key, default)
+    manuals = st.session_state.get("demo_manuals", [])
+    active = []
+    for m in manuals:
+        dt = now - float(m["start"])
+        dur = float(m.get("dur", 0.3))
 
-with st.sidebar:
-    st.header("⚙️ Controls")
-
-    mode = st.radio(
-        "Steering input mode",
-        ["Digital tap steering", "Proportional key-hold steering"],
-        help="Digital tap: repeated arrow-key taps at a frequency proportional to wheel "
-             "angle. Proportional hold: key stays held down while wheel angle exceeds "
-             "the dead-zone.",
-    )
-    st.session_state["mode"] = mode
-
-    st.markdown("---")
-    st.subheader("🎯 Calibration")
-    st.write(
-        "Hold both hands up in the 'steering wheel' position and sit/stand naturally, "
-        "then click below to set your neutral baseline."
-    )
-    if st.button("Capture neutral baseline"):
-        CALIBRATION["_capture_next"] = True
-        st.success("Calibrating on next frame... hold your pose steady.")
-
-    lean_threshold = st.slider(
-        "Lean threshold (deg) for accelerate/brake", 2, 20, int(LEAN_THRESHOLD_DEFAULT)
-    )
-
-    st.markdown("---")
-    st.subheader("⏺️ Session Recording")
-    record = st.checkbox("Record annotated video + gesture CSV log")
-
-    if os.path.exists(st.session_state["mp4_path"]) and os.path.getsize(st.session_state["mp4_path"]) > 0:
-        with open(st.session_state["mp4_path"], "rb") as f:
-            st.download_button("⬇️ Download session MP4", f, file_name="session_recording.mp4")
-    if os.path.exists(st.session_state["csv_path"]) and os.path.getsize(st.session_state["csv_path"]) > 0:
-        with open(st.session_state["csv_path"], "rb") as f:
-            st.download_button("⬇️ Download gesture log (CSV)", f, file_name="gesture_events.csv")
-
-    st.markdown("---")
-    st.caption(
-        "Calibrated: **%s**" % ("yes" if CALIBRATION["calibrated"] else "not yet")
-    )
-
-col_cam, col_game = st.columns([1, 1])
-
-with col_cam:
-    st.subheader("📷 Live Webcam — Hand-Wheel + Torso Overlay")
-    ctx = webrtc_streamer(
-        key="gesture-racing",
-        video_processor_factory=GestureProcessor,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
-
-with col_game:
-    st.subheader("🎮 Built-in Racing Mini-Game (driven by dispatched key events)")
-    game_placeholder = st.empty()
-
-metrics_placeholder = st.empty()
-log_placeholder = st.empty()
-
-if ctx.video_processor:
-    ctx.video_processor.recording = record
-    ctx.video_processor.lean_threshold = lean_threshold
-
-if ctx.state.playing:
-    while ctx.state.playing:
-        if ctx.video_processor is None:
-            time.sleep(0.1)
+        if dt < 0.0:
+            active.append(m)
             continue
 
-        ctx.video_processor.recording = record
-        ctx.video_processor.lean_threshold = lean_threshold
+        if dt <= dur:
+            vec = DIRECTION_VECTORS.get(m.get("dir"), np.array([0.0, 0.0], dtype=np.float32))
+            amp = float(m.get("amp", 120.0))
+            offset = offset + vec * (amp * math.sin(math.pi * (dt / max(dur, 1e-6))))
+            active.append(m)
 
-        loop_start = time.time()
-        with STATE_LOCK:
-            snap = dict(SHARED_STATE)
-            recent_events = list(SHARED_STATE["event_log"][-8:])
+    st.session_state["demo_manuals"] = active
 
-        steering_value = snap["steering_value"]
-        accel = snap["accel"]
-        brake = snap["brake"]
+    offset[0] += 9.0 * math.sin(now * 1.7)
+    offset[1] += 7.0 * math.cos(now * 2.4)
 
-        # ---- simple kart physics driven by the gesture signal ----
-        speed = st.session_state["kart_speed"]
-        heading = st.session_state["kart_heading"]
-        pos_x = st.session_state["kart_x"]
-        pos_y = st.session_state["kart_y"]
+    return offset
 
-        if accel:
-            speed = min(speed + 2.0, 20.0)
-        elif brake:
-            speed = max(speed - 3.0, -6.0)
+
+def process_demo_timeline(now):
+    timeline = st.session_state.get("demo_timeline", [])
+    idx = st.session_state.get("demo_next_idx", 0)
+
+    while idx < len(timeline) and float(timeline[idx]["t"]) <= now:
+        e = timeline[idx]
+
+        if e.get("kind") == "flick":
+            add_event(
+                e.get("dir", "Up"),
+                random.randint(24, 48),
+                round(random.uniform(0.88, 0.99), 2),
+                "demo",
+                True,
+                "scripted flick",
+            )
         else:
-            speed *= 0.92
-
-        heading += steering_value * 6.0
-        pos_x += speed * math.sin(math.radians(heading)) * 0.3
-        pos_y -= speed * math.cos(math.radians(heading)) * 0.3
-        pos_x = max(6, min(94, pos_x))
-        pos_y = max(6, min(94, pos_y))
-
-        st.session_state.update(
-            {"kart_speed": speed, "kart_heading": heading, "kart_x": pos_x, "kart_y": pos_y}
-        )
-
-        key_js = build_key_dispatch_js(
-            st.session_state["mode"], steering_value, accel, brake, LOOP_TICK_SECONDS
-        )
-        latency_ms = (time.time() - snap["last_frame_ts"]) * 1000.0
-
-        with game_placeholder:
-            components.html(
-                build_game_html(pos_x, pos_y, heading, speed, key_js, snap["gesture_label"], latency_ms),
-                height=340,
+            add_event(
+                "Noise",
+                random.randint(31, 62),
+                round(random.uniform(0.35, 0.62), 2),
+                "demo",
+                False,
+                "near-miss wobble",
             )
 
-        with metrics_placeholder.container():
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Steering angle (EMA)", f"{snap['ema_angle']:.1f}°")
-            m2.metric("Steering value", f"{steering_value:+.2f}")
-            m3.metric("Accelerate", "ON" if accel else "off")
-            m4.metric("Brake", "ON" if brake else "off")
-            st.progress(min(1.0, abs(steering_value)))
-            st.caption(
-                f"Gesture: **{snap['gesture_label']}** &nbsp;|&nbsp; "
-                f"Hands detected: {snap['hands_detected']} &nbsp;|&nbsp; "
-                f"Pose detected: {snap['pose_detected']}"
-            )
+        idx += 1
 
-        with log_placeholder.container():
-            if recent_events:
-                st.write("**Recent gesture events**")
-                for e in reversed(recent_events):
-                    st.text(f"{e['timestamp']}  {e['event']}  ({e['detail']})")
+    st.session_state["demo_next_idx"] = idx
 
-        elapsed = time.time() - loop_start
-        time.sleep(max(0.0, LOOP_TICK_SECONDS - elapsed))
-else:
-    st.info(
-        "Click **Start** on the webcam widget above to begin. Then use the sidebar to "
-        "capture your neutral calibration baseline before steering."
+
+def render_demo_frame(now):
+    h, w = 480, 640
+    img = np.full((h, w, 3), (26, 29, 40), dtype=np.uint8)
+
+    for x in range(0, w, 48):
+        cv2.line(img, (x, 0), (x, h), (38, 42, 58), 1)
+    for y in range(0, h, 48):
+        cv2.line(img, (0, y), (w, y), (38, 42, 58), 1)
+
+    center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+    offset = demo_offset(now)
+    tip = center + offset
+    tip_int = (int(tip[0]), int(tip[1]))
+
+    wrist = tip + np.array([20, 120], dtype=np.float32)
+    palm = tip + np.array([2, 70], dtype=np.float32)
+
+    cv2.line(img, tuple(wrist.astype(int)), tuple(palm.astype(int)), (0, 200, 190), 4)
+    cv2.line(img, tuple(palm.astype(int)), tip_int, (0, 220, 255), 4)
+
+    for j in range(-2, 3):
+        knuckle = palm + np.array([j * 14, 18], dtype=np.float32)
+        finger_mid = palm + np.array([j * 8, 60], dtype=np.float32)
+        cv2.line(img, tuple(knuckle.astype(int)), tuple(finger_mid.astype(int)), (0, 180, 170), 2)
+
+    cv2.circle(img, tuple(wrist.astype(int)), 10, (0, 200, 190), -1)
+    cv2.circle(img, tip_int, 12, (0, 255, 255), -1)
+
+    if now < 3.5:
+        cv2.rectangle(
+            img,
+            (w // 2 - 130, h // 2 - 130),
+            (w // 2 + 130, h // 2 + 130),
+            (0, 255, 255),
+            2,
+        )
+        cv2.putText(
+            img,
+            "Calibration: hold hand steady in box",
+            (w // 2 - 240, 45),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+        )
+
+    events = get_events(10)
+    last_accepted = None
+    for e in reversed(events):
+        if e.get("accepted"):
+            last_accepted = e
+            break
+
+    if last_accepted and time.time() - float(last_accepted.get("epoch", 0.0)) < 1.2:
+        cv2.putText(
+            img,
+            str(last_accepted.get("gesture", "")),
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.5,
+            (0, 255, 0),
+            4,
+        )
+
+    latency = int(last_accepted.get("latency_ms", 0)) if last_accepted else int(18 + 8 * abs(math.sin(now * 2.1)))
+    cv2.putText(
+        img,
+        f"Latency: {latency} ms",
+        (20, 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 0),
+        2,
     )
-    if ctx.video_processor is not None:
-        ctx.video_processor.close_writer()
+
+    cv2.putText(
+        img,
+        "Demo mode: synthetic hand + real event pipeline",
+        (20, h - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (170, 180, 200),
+        1,
+    )
+
+    ensure_recorder(img, fps=12.0)
+    return img
+
+
+def simulate_gesture(direction, accepted=True, source_name="manual-button"):
+    if accepted:
+        latency = random.randint(22, 48)
+        confidence = random.uniform(0.90, 0.99)
+        note = "manual button"
+        gesture = direction
+    else:
+        latency = random.randint(35, 70)
+        confidence = random.uniform(0.35, 0.65)
+        note = "manual near-miss"
+        gesture = "Noise"
+
+    add_event(gesture, latency, confidence, source_name, accepted, note)
+
+    now_rel = time.time() - st.session_state.get("demo_start", time.time())
+    manuals = st.session_state.setdefault("demo_manuals", [])
+
+    if accepted:
+        manuals.append(
+            {
+                "start": now_rel,
+                "dir": direction,
+                "dur": 0.28,
+                "amp": 125.0,
+            }
+        )
+    else:
+        manuals.append(
+            {
+                "start": now_rel,
+                "dir": random.choice(list(DIRECTION_VECTORS.keys())),
+                "dur": 0.45,
+                "amp": 26.0,
+            }
+        )
+
+
+@st.fragment(run_every=0.08)
+def demo_view():
+    if "demo_start" not in st.session_state:
+        reset_demo()
+
+    now = time.time() - st.session_state["demo_start"]
+    process_demo_timeline(now)
+    img = render_demo_frame(now)
+    st.image(img, channels="BGR", use_container_width=True)
+
+
+@st.fragment(run_every=0.15)
+def gesture_dispatcher():
+    last_seen = st.session_state.get("last_seen_event_id", 0)
+    events = get_events()
+
+    if not events:
+        return
+
+    max_id = max(e["id"] for e in events)
+    if max_id <= last_seen:
+        return
+
+    new_events = [e for e in events if e["id"] > last_seen]
+    st.session_state["last_seen_event_id"] = max_id
+
+    accepted = [
+        e for e in new_events
+        if e["accepted"] and e["gesture"] in GESTURE_TO_KEY
+    ]
+
+    if accepted:
+        components.html(dispatch_js(accepted[-1]["gesture"]), height=0)
+
+
+@st.fragment(run_every=0.5)
+def status_panel():
+    stats = STORE["stats"]
+    total = stats["accepted"] + stats["rejected"]
+    accuracy = int(100 * stats["accepted"] / total) if total else 100
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Successful flicks", stats["accepted"])
+    c2.metric("Missed / noise", stats["rejected"])
+    c3.metric("Accuracy", f"{accuracy}%")
+
+    events = get_events(14)[::-1]
+    if events:
+        df = pd.DataFrame(events)
+        df = df[["time", "gesture", "latency_ms", "confidence", "source", "accepted", "note"]]
+        df["confidence"] = (df["confidence"] * 100).round(0).astype(int).astype(str) + "%"
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("No gesture events yet.")
+
+
+st.sidebar.title("Air Flick Controls")
+
+source = st.sidebar.radio(
+    "Input source",
+    [DEMO_MODE, REAL_MODE],
+    index=0,
+    help="Auto Demo starts instantly with realistic simulated gestures. Real Webcam uses MediaPipe Hands on your live camera.",
+)
+
+if source == DEMO_MODE:
+    if st.session_state.get("last_source") != DEMO_MODE:
+        reset_demo()
+    st.session_state["last_source"] = DEMO_MODE
+else:
+    st.session_state["last_source"] = REAL_MODE
+
+st.session_state.setdefault("last_seen_event_id", 0)
+
+threshold = st.sidebar.slider(
+    "Flick speed threshold (lower = more sensitive)",
+    0.60,
+    3.00,
+    float(STORE["config"].get("threshold", 1.35)),
+    0.05,
+)
+STORE["config"]["threshold"] = float(threshold)
+
+cooldown_ms = st.sidebar.slider(
+    "Cooldown after gesture (ms)",
+    250,
+    600,
+    int(float(STORE["config"].get("cooldown", 0.35)) * 1000),
+    25,
+)
+STORE["config"]["cooldown"] = float(cooldown_ms) / 1000.0
+
+record = st.sidebar.checkbox(
+    "Record session to MP4",
+    value=bool(STORE["config"].get("record", False)),
+)
+if record != bool(STORE["config"].get("record", False)):
+    STORE["config"]["record"] = bool(record)
+    if not record:
+        finalize_recording()
+
+if st.sidebar.button("Finalize recording"):
+    finalize_recording()
+
+rec = STORE["recorder"]
+if rec.get("ready") and rec.get("path") and os.path.exists(rec.get("path", "")) and rec.get("writer") is None:
+    try:
+        with open(rec["path"], "rb") as f:
+            video_bytes = f.read()
+        st.sidebar.download_button(
+            "Download MP4 demo video",
+            data=video_bytes,
+            file_name=os.path.basename(rec["path"]),
+            mime="video/mp4",
+        )
+    except Exception:
+        st.sidebar.warning("Could not load MP4 file for download.")
+elif rec.get("writer") is not None:
+    st.sidebar.caption("Recording in progress...")
+
+events_all = get_events()
+if events_all:
+    csv_bytes = pd.DataFrame(events_all).to_csv(index=False).encode("utf-8")
+    st.sidebar.download_button(
+        "Download gesture CSV",
+        data=csv_bytes,
+        file_name="gesture_events.csv",
+        mime="text/csv",
+    )
+
+if st.sidebar.button("Clear log & stats"):
+    with STORE["lock"]:
+        STORE["events"] = []
+        STORE["stats"] = {"accepted": 0, "rejected": 0}
+        STORE["next_id"] = 0
+    st.session_state["last_seen_event_id"] = 0
+
+if source == DEMO_MODE:
+    if st.sidebar.button("Reset demo timeline"):
+        reset_demo()
+
+if source == REAL_MODE:
+    st.sidebar.markdown("### Calibration")
+
+    if st.sidebar.button("Start calibration"):
+        STORE["config"]["calibrating"] = True
+        STORE["config"]["calibrated"] = False
+        STORE["calib"]["samples"] = []
+
+    if st.sidebar.button("Skip calibration (defaults)"):
+        STORE["calib"]["neutral"] = (0.5, 0.5)
+        STORE["calib"]["scale"] = 0.08
+        STORE["config"]["calibrated"] = True
+        STORE["config"]["calibrating"] = False
+
+    status = "Calibrated" if STORE["config"].get("calibrated") else (
+        "Calibrating..." if STORE["config"].get("calibrating") else "Not calibrated"
+    )
+    st.sidebar.caption(f"Calibration status: {status}")
+
+st.title("Air Flick Gesture Runner")
+st.caption(
+    "Live fingertip flick detection with MediaPipe landmark tracking, calibration, gesture classification, "
+    "cooldown logic, latency display, event logging, and browser-side arrow-key dispatch."
+)
+
+left, right = st.columns([1, 1], gap="large")
+
+with left:
+    st.subheader("Camera / Demo View")
+
+    if source == DEMO_MODE:
+        demo_view()
+        st.caption(
+            "Auto Demo is running instantly with realistic simulated gestures. "
+            "Switch to Real Webcam to use your actual camera."
+        )
+    else:
+        if not WEBRTC_OK:
+            st.error("streamlit-webrtc is not available. Install dependencies from requirements.txt.")
+        elif not MP_OK:
+            st.warning("MediaPipe is not available in this environment. Real webcam tracking is disabled.")
+
+        if WEBRTC_OK:
+            webrtc_streamer(
+                key="real-webcam",
+                video_processor_factory=HandFlickProcessor,
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,
+            )
+            st.caption(
+                "Press START in the webcam widget and allow camera access. "
+                "Calibration begins automatically when your hand is visible."
+            )
+
+    st.markdown("**Manual test buttons**")
+    mb = st.columns(5)
+
+    if mb[0].button("Up", use_container_width=True):
+        simulate_gesture("Up", accepted=True)
+
+    if mb[1].button("Down", use_container_width=True):
+        simulate_gesture("Down", accepted=True)
+
+    if mb[2].button("Left", use_container_width=True):
+        simulate_gesture("Left", accepted=True)
+
+    if mb[3].button("Right", use_container_width=True):
+        simulate_gesture("Right", accepted=True)
+
+    if mb[4].button("Near-miss", use_container_width=True):
+        simulate_gesture("Up", accepted=False)
+
+with right:
+    st.subheader("Game viewport")
+    components.html(GAME_HTML, height=500, scrolling=False)
+
+    gesture_dispatcher()
+
+    st.subheader("Gesture log & accuracy")
+    status_panel()
+
+    st.caption(
+        "Browser security note: synthetic keyboard events can reliably drive same-origin embedded content. "
+        "Cross-origin tabs/iframes usually cannot receive injected events without the target page cooperating."
+    )
